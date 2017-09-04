@@ -1,0 +1,336 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use File::Spec;
+use Cwd;
+use Config;
+
+my @functions = qw/host port user pass -batch -details/;
+my @programs = qw/mysql mysqldump mysqladmin mysqlimport mysqlcheck/;
+my @details = qw/naga script mysql percona dsn url env_ prefix_ script_ suffix_ hive_/;
+my %function_lookup = map { $_ => 1 } (@functions, @programs);
+my %details_lookup = map { $_ => 1 } @details;
+
+my $compgen = 0;
+my $man = 0;
+my $help = 0;
+my $list = 0;
+
+foreach my $arg (@ARGV) {
+  if($arg =~ /\-h(?:elp)?/) {
+    $help = 1;
+  }
+  elsif($arg =~ /\-m(?:an)?/) {
+    $man = 1;
+  }
+  elsif($arg =~ /\-c(?:ompgen)?/) {
+    $compgen = 1;
+  }
+  elsif($arg =~ /\-l(?:list)?/) {
+    $list = 1;
+  }
+}
+
+# pod2usage(1) if $help; #help means help
+# pod2usage(-exitval => 0, -verbose => 2) if $man; #man means man
+
+my $CONFIGS = _read_and_merge();
+
+list() if $list;
+compgen() if $compgen;
+run();
+
+sub list {
+  print $_."\n" for servers();
+  exit 0;
+}
+
+sub servers {
+  my @servers = grep {$_ ne 'ALIASES' } keys %{$CONFIGS};
+  push(@servers, keys %{$CONFIGS->{ALIASES}});
+  return sort @servers;
+}
+
+sub compgen {
+  my ($compgen_arg, $server, $user, $function, $details_arg) = @ARGV;
+  $server = q{} if ! $server;
+  $user = q{} if ! $user;
+  $function = q{} if ! $function;
+  $details_arg = q{} if ! $details_arg;
+
+  my $server_name = $CONFIGS->{ALIASES}->{$server} || $server;
+  my $details = (exists $CONFIGS->{$server_name}) ? $CONFIGS->{$server_name} : undef;
+
+  if(! $details) { # if we didn't get through to specifying a valid server then print out servers
+    print join(" ", servers());
+    return;
+  }
+  else {
+    my $valid_user = exists $details->{logins}->{$user};
+    if(! $valid_user) { # no details means bad server name (and we have a user now)
+      my @valid_logins;
+      foreach my $login (sort keys %{$CONFIGS->{$server_name}->{logins}}) {
+        my $password = $CONFIGS->{$server_name}->{logins}->{$login};
+        if($password ne 'xxx') {
+          push(@valid_logins, $login);
+        }
+      }
+      print join(q{ }, @valid_logins);
+      return;
+    }
+    else {
+      # See how many could still be active
+      my $valid_function = grep { $_ =~ /$function/ } keys %function_lookup;
+      # Check if we got a 100% hit and no other possible matches. Otherwise keep printing all the functions
+      if($valid_function != 1 || ! exists $function_lookup{$function}) { # want to list avalable functions
+        print join(q{ }, sort keys %function_lookup);
+        return;
+      }
+
+      if($function eq '-details') {
+        my $valid_details_arg = $details_lookup{$details_arg};
+        if(! $valid_details_arg) { # want to print available details
+          print join(q{ }, sort @details);
+          return;
+        }
+      }
+    }
+  }
+  exit 0;
+}
+
+sub run {
+  my ($server, $user, @args) = @ARGV;
+  my $server_name = $CONFIGS->{ALIASES}->{$server} || $server;
+  my $details = $CONFIGS->{$server_name};
+  exit(1) if ! defined $details;
+  _run_mysql($server_name, $details->{port}, $user, $details->{logins}->{$user}, @args);
+}
+
+sub _read_and_merge {
+  my $lookup = {};
+  my @configs = _find_configs();
+  foreach my $config (@configs) {
+    my $hash = _read_file($config);
+    foreach my $server (keys %{$hash}) {
+      # If nothing existed before just assign it in right away
+      if(! exists $lookup->{$server}) {
+        $lookup->{$server} = $hash->{$server};
+      }
+      # Otherwise we need to merge and 1st one there wins
+      else {
+        my $server_details = $lookup->{$server};
+        my $new_details = $hash->{$server};
+        #port 
+        if(! exists $server_details->{port} && exists $new_details->{port}) {
+          $server_details->{port} = $new_details->{port};
+        }
+
+        # add in new/unique aliases
+        if(@{$new_details->{aliases}}) {
+          my @aliases = _uniq(@{$server_details->{aliases}}, @{$new_details->{aliases}});
+          $server_details->{aliases} = \@aliases;
+        }
+
+        # logins
+        foreach my $login (keys %{$new_details->{logins}}) {
+          if(! exists $server_details->{logins}->{$login}) {
+            $server_details->{logins}->{$login} = $new_details->{logins}->{$login};
+          }
+        }
+      }
+    }
+  }
+
+  #Populate alias lookup
+  my $alias_lookup = {};
+  foreach my $server (keys %{$lookup}) {
+    $alias_lookup->{$_} = $server for @{$lookup->{$server}->{aliases}};
+  }
+  $lookup->{ALIASES} = $alias_lookup;
+
+  return $lookup;
+}
+
+sub _find_configs {
+  my @configs;
+  my $cwd = getcwd();
+  foreach my $dir (_path_to_dirs()) {
+    if(! -r $dir) {
+      next;
+    }
+    chdir $dir;
+    foreach my $file (sort glob "*.mysqlcmd.cfg") {
+      push(@configs, File::Spec->catfile($dir, $file));
+    }
+  }
+  chdir $cwd;
+  return @configs;
+}
+
+sub _path_to_dirs {
+  my $env = $ENV{MYSQLCMD_PATH} || '.';
+  my $sep = $Config{path_sep};
+  return split(/\Q$sep\E/, $env);
+}
+
+# Read in a tab separated file in. Assume 1st line are headers. 
+# Magic headers are server and port. All others are assumed to be user names
+sub _read_file {
+  my ($file) = @_;
+  my $lookup = {
+    # format is { server => { port => port, aliases => [alias,alias], logins => {user => pass, user => '' }}}
+  };
+  if(-r $file) {
+    open my $fh, '<', $file or die "Cannot open $file for reading: $!";
+    my @headers;
+    my $columns = 0;
+    my $first = 1;
+    while(my $line = <$fh>) {
+      chomp $line;
+      my @rows = split(/\s+/, $line);
+      if($first) {
+        @headers = @rows;
+        $columns = scalar(@headers);
+        $first = 0;
+      }
+      else {
+        my $row_to_hash = {};
+        for(my $i = 0; $i < $columns; $i++) {
+          $row_to_hash->{$headers[$i]} = $rows[$i];
+        }
+        my $server = $row_to_hash->{server};
+        $lookup->{$server} = { logins => {}, aliases => [] };
+        $lookup->{$server}->{port} = $row_to_hash->{port} if $row_to_hash->{port};
+        $lookup->{$server}->{aliases} = [split(/,/, $row_to_hash->{alias})] if $row_to_hash->{alias};
+        delete $row_to_hash->{$_} for qw/server port alias/; # remove used keys. All remaining are logins
+        foreach my $login (keys %{$row_to_hash}) {
+          $lookup->{$server}->{logins}->{$login} = $row_to_hash->{$login} || q{};
+        }
+      }
+    }
+    close $fh;
+  }
+  return $lookup;
+}
+
+sub _uniq {
+  my %seen;
+  return grep { !$seen{$_}++ } @_;
+}
+
+sub _run_mysql {
+  my ($host, $port, $user, $pass, @args) = @_;
+  $port = 3306 if ! $port;
+  my $pass_defined = (defined $pass && $pass ne '-' && $pass ne 'xxx' && $pass ne q{}) ? 1 : 0;
+  $pass = q{} if ! $pass_defined;
+  my @mysql = ("--host=${host}", "--port=${port}", "--user=${user}");
+  $ENV{MYSQL_PWD}=$pass if $pass_defined;
+
+  if(scalar(@args) > 0) {
+
+    my $count = scalar(grep { $args[0] ne $_} @programs);
+
+    #Batch is specical as it shortcuts the options to run on cmd line
+    #without any fussy output
+    if($args[0] =~ /^\-*batch$/) {
+      my ($batch_cmd, $db, $sql) = @args;
+      die "No database given to the -batch command" if ! $db;
+      die "No SQL given to the -batch command" if ! $sql;
+      @args = ();
+      unshift(@mysql, qw(mysql -B -N));
+      push(@mysql, '-e', $sql, $db);
+    }
+    elsif($args[0] =~ /^(host|port|user|pass)$/) {
+      my @names = split(/,/, $args[0]);
+
+      my %variables = ('host', $host, 'port', $port, 'user', $user, 'pass', $pass);
+      my @values = map {$variables{$_}} @names;
+      print join(" ", @values)."\n";
+      exit 0;
+    }
+    #Details means print out to STDOUT all login details in a few formats
+    elsif($args[0] =~ /^\-*details$/) {
+      my $mysql_str = join(' ', @mysql);
+      $mysql_str .= " --pass=${pass}" if $pass_defined;
+      my $naga_str = "--host ${host} --port ${port} --user ${user}";
+      $naga_str .= " --pass ${pass}" if $pass_defined;
+      if(scalar(@args) > 1) {
+        if($args[1] eq 'naga' || $args[1] eq 'script') {
+          print $naga_str, "\n";
+        }
+        elsif($args[1] eq 'mysql') {
+          print $mysql_str, "\n";
+        }
+        elsif($args[1] eq 'percona' || $args[1] eq 'dsn') {
+            if(defined $pass) {
+                print "h=${host},P=${port},u=${user},p=${pass}\n";
+            } else {
+                print "h=${host},P=${port},u=${user}\n";
+            }
+        }
+        elsif($args[1] eq 'url') {
+          my $db = $args[2] // '';
+          if (defined $pass) {
+            print "mysql://$user:$pass\@$host:$port/$db\n";
+          } 
+          else {
+            print "mysql://$user\@$host:$port/$db\n";
+          }
+        }
+        elsif($args[1] =~ /env_*(\w*)/) {
+          my $prefix = $1 || '';
+          print "${prefix}HOST=$host\n";
+          print "${prefix}PORT=$port\n";
+          print "${prefix}USER=$user\n";
+          print "${prefix}PASS=$pass\n" if $pass_defined;
+        }
+        elsif($args[1] =~ /(prefix|script)_(\w+)/) {
+          my $prefix = $2;
+          my $prefix_str = "--${prefix}host ${host} --${prefix}port ${port} --${prefix}user ${user}";
+          $prefix_str .= " --${prefix}pass ${pass}" if $pass_defined;
+          print $prefix_str, "\n";
+        }
+        elsif($args[1] =~ /(suffix)_(\w+)/) {
+          my $suffix = $2;
+          my $suffix_str = "--host${suffix} ${host} --port${suffix} ${port} --user${suffix} ${user}";
+          $suffix_str .= " --pass${suffix} ${pass}" if $pass_defined;
+          print $suffix_str, "\n";
+        }
+        elsif($args[1] =~ /(hive)(_(\w+))?/) {
+          my $arg = $3 || 'pipeline_db';
+          my $suffix_str = "-${arg} -host=${host} -${arg} -port=${port} -${arg} -user=${user}";
+          $suffix_str .= " -${arg} -pass=${pass}" if $pass_defined;
+          print $suffix_str, "\n";
+        }
+        else {
+          warn 'Unknown type of arg given: '.$args[1];
+          exit 1;
+        }
+      }
+      else {
+        print $mysql_str, "\n";
+        print $naga_str, "\n";
+      }
+      exit 0;
+    }
+    elsif($count == scalar(@programs)) {
+      # If we got here then there is no cmd name, so we default to mysql
+      unshift(@mysql, 'mysql');
+    }
+    else {
+      # If we got here then there is a cmd name like mysqldump, so we use it
+      my $val = shift @args;
+      unshift(@mysql, $val);
+    }
+  }
+  else {
+    unshift(@mysql, 'mysql');
+  }
+
+  unshift(@args, '-B') if grep {$_ eq '-e'} @args;
+  warn @mysql, @args;
+  exec @mysql, @args;
+}
